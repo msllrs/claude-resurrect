@@ -1,0 +1,526 @@
+#!/usr/bin/env node
+/**
+ * claude-resurrect — bring back your Claude Code sessions after a reboot or crash.
+ *
+ * How it works:
+ *   - `snapshot` (run every 30s by a LaunchAgent) copies Claude Code's live
+ *     session registry (~/.claude/sessions/*.json) AND Ghostty's window/split
+ *     layout (via AppleScript) into a state file, stamped with the current
+ *     boot time. Each Ghostty pane is matched to the Claude session running
+ *     in it (by title, then by working directory).
+ *   - After a reboot, the first snapshot tick notices the boot time changed
+ *     and preserves the pre-crash state as pending-restore.json before
+ *     overwriting anything.
+ *   - `restore` rebuilds each window that held Claude sessions — recreating
+ *     its splits (heuristic 2-column grid, not exact geometry), resuming
+ *     `claude --resume <session-id>` in matched panes and plain shells in the
+ *     rest. Sessions that weren't in any pane get their own window.
+ *
+ * Sessions that exit gracefully while the machine is up disappear from the
+ * live registry and are pruned on the next tick, so they are never resurrected.
+ */
+
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const { execFileSync, execSync } = require("child_process");
+
+const HOME = os.homedir();
+const CLAUDE_SESSIONS_DIR = path.join(HOME, ".claude", "sessions");
+const STATE_DIR = path.join(HOME, ".local", "state", "claude-resurrect");
+const CURRENT = path.join(STATE_DIR, "current.json");
+const PENDING = path.join(STATE_DIR, "pending-restore.json");
+const ARCHIVE_DIR = path.join(STATE_DIR, "archive");
+const DAEMON_LINK = path.join(STATE_DIR, "bin", "claude-resurrectd");
+const PLIST_LABEL = "com.claude-resurrect.snapshot";
+const PLIST_PATH = path.join(HOME, "Library", "LaunchAgents", `${PLIST_LABEL}.plist`);
+const SNAPSHOT_INTERVAL_SECONDS = 30;
+
+// ---------------------------------------------------------------- utilities
+
+function bootTime() {
+  const out = execSync("sysctl -n kern.boottime", { encoding: "utf8" });
+  const m = out.match(/sec\s*=\s*(\d+)/);
+  if (!m) throw new Error(`could not parse kern.boottime: ${out}`);
+  return Number(m[1]);
+}
+
+function pidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code === "EPERM"; // alive but not ours
+  }
+}
+
+function readJson(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function writeJsonAtomic(file, data) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.tmp-${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+  fs.renameSync(tmp, file);
+}
+
+function asQuoted(s) {
+  return `"${String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+function osascript(script) {
+  return execFileSync("osascript", ["-e", script], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+}
+
+function relTimeName(ms) {
+  return ms ? new Date(ms).toISOString() : "?";
+}
+
+function shortCwd(cwd) {
+  return cwd && cwd.startsWith(HOME) ? "~" + cwd.slice(HOME.length) : cwd || "?";
+}
+
+// ------------------------------------------------------- claude live registry
+
+/** Read Claude Code's live registry: one JSON file per running process. */
+function liveSessions() {
+  let files;
+  try {
+    files = fs.readdirSync(CLAUDE_SESSIONS_DIR).filter((f) => f.endsWith(".json"));
+  } catch {
+    return [];
+  }
+  const sessions = [];
+  for (const f of files) {
+    const s = readJson(path.join(CLAUDE_SESSIONS_DIR, f));
+    if (!s || !s.sessionId || !s.pid) continue;
+    if (!pidAlive(s.pid)) continue;
+    sessions.push({
+      sessionId: s.sessionId,
+      pid: s.pid,
+      cwd: s.cwd,
+      kind: s.kind || "interactive",
+      name: s.name || s.sessionId.slice(0, 8),
+      status: s.status || "unknown",
+      startedAt: s.startedAt,
+    });
+  }
+  return sessions;
+}
+
+// ------------------------------------------------------------- ghostty layout
+
+/**
+ * Dump Ghostty's window -> tab -> terminal tree via AppleScript.
+ * tty/pid properties exist in newer Ghostty builds; guarded so 1.3.x works.
+ * Returns null if Ghostty isn't running or scripting is unavailable.
+ */
+function captureGhosttyLayout() {
+  // NB: inside the tell block, bare `tab` resolves to Ghostty's tab *class*,
+  // not the tab character — hence the d variable defined outside it.
+  const script = `
+set d to character id 9
+tell application "Ghostty"
+  set out to ""
+  repeat with w in windows
+    set out to out & "W" & d & (id of w) & linefeed
+    repeat with tb in tabs of w
+      set out to out & "T" & d & ((index of tb) as text) & linefeed
+      repeat with t in terminals of tb
+        set cwdStr to ""
+        set titleStr to ""
+        set ttyStr to ""
+        try
+          set cwdStr to (working directory of t) as text
+        end try
+        try
+          set titleStr to (name of t) as text
+        end try
+        try
+          set ttyStr to (tty of t) as text
+        end try
+        set out to out & "P" & d & cwdStr & d & titleStr & d & ttyStr & linefeed
+      end repeat
+    end repeat
+  end repeat
+  return out
+end tell`;
+  let raw;
+  try {
+    raw = osascript(script);
+  } catch {
+    return null; // Ghostty not running, or Automation permission missing
+  }
+  const windows = [];
+  let win = null, tab = null;
+  for (const line of raw.split("\n")) {
+    const [type, ...cols] = line.split("\t");
+    if (type === "W") {
+      win = { windowId: cols[0], tabs: [] };
+      windows.push(win);
+      tab = null;
+    } else if (type === "T" && win) {
+      tab = { index: Number(cols[0]) || 1, panes: [] };
+      win.tabs.push(tab);
+    } else if (type === "P" && tab) {
+      tab.panes.push({ cwd: cols[0] || null, title: cols[1] || null, tty: cols[2] || null, sessionId: null });
+    }
+  }
+  return windows.length > 0 ? windows : null;
+}
+
+/** ttys for a claude pid, e.g. "ttys004" -> "/dev/ttys004". */
+function ttyOfPid(pid) {
+  try {
+    const t = execSync(`ps -o tty= -p ${pid}`, { encoding: "utf8" }).trim();
+    return t && t !== "??" ? `/dev/${t}` : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Match sessions to panes, most precise signal first:
+ *   1. tty (exact — needs Ghostty > 1.3 to expose it; guarded)
+ *   2. terminal title === session name (claude sets titles for named sessions)
+ *   3. same cwd (arbitrary within identical-cwd groups — visually equivalent)
+ * Mutates panes (sets sessionId).
+ */
+function matchSessionsToPanes(layout, sessions) {
+  const panes = layout.flatMap((w) => w.tabs.flatMap((t) => t.panes));
+  const unclaimed = new Set(sessions);
+
+  const claim = (pane, session) => {
+    pane.sessionId = session.sessionId;
+    unclaimed.delete(session);
+  };
+
+  // pass 1: tty
+  for (const s of unclaimed) {
+    const tty = ttyOfPid(s.pid);
+    if (!tty) continue;
+    const pane = panes.find((p) => !p.sessionId && p.tty === tty);
+    if (pane) claim(pane, s);
+  }
+  // pass 2: unique title match
+  for (const s of [...unclaimed]) {
+    const hits = panes.filter((p) => !p.sessionId && p.title === s.name);
+    if (hits.length === 1) claim(hits[0], s);
+  }
+  // pass 3: cwd (in order)
+  for (const s of [...unclaimed]) {
+    const pane = panes.find((p) => !p.sessionId && p.cwd === s.cwd);
+    if (pane) claim(pane, s);
+  }
+}
+
+// ------------------------------------------------------------------ snapshot
+
+function snapshot() {
+  const boot = bootTime();
+  const prev = readJson(CURRENT);
+
+  // A snapshot from a previous boot means the machine went down while those
+  // sessions were running. Preserve it before we overwrite.
+  if (prev && prev.bootTime !== boot && (prev.sessions || []).length > 0) {
+    writeJsonAtomic(PENDING, prev);
+    fs.mkdirSync(ARCHIVE_DIR, { recursive: true });
+    writeJsonAtomic(path.join(ARCHIVE_DIR, `${prev.savedAt || "unknown"}.json`), prev);
+  }
+
+  const sessions = liveSessions();
+  const layout = captureGhosttyLayout();
+  if (layout) matchSessionsToPanes(layout, sessions);
+
+  writeJsonAtomic(CURRENT, {
+    bootTime: boot,
+    savedAt: new Date().toISOString().replace(/[:.]/g, "-"),
+    sessions,
+    layout,
+  });
+}
+
+// ---------------------------------------------------------------------- list
+
+function loadRestorable() {
+  const pending = readJson(PENDING);
+  if (pending) return { source: "pending", data: pending };
+  const current = readJson(CURRENT);
+  if (current) return { source: "current", data: current };
+  return null;
+}
+
+function list() {
+  const loaded = loadRestorable();
+  if (!loaded) {
+    console.log("No snapshot yet. Run `claude-resurrect install` to start the snapshotter.");
+    return;
+  }
+  const { source, data } = loaded;
+  const live = new Set(liveSessions().map((s) => s.sessionId));
+  const label = source === "pending" ? "pending restore (saved before last shutdown/crash)" : "latest snapshot";
+  console.log(`Sessions in ${label}:\n`);
+  const paneOf = new Map();
+  (data.layout || []).forEach((w, wi) =>
+    w.tabs.forEach((t) => t.panes.forEach((p) => { if (p.sessionId) paneOf.set(p.sessionId, `win ${wi + 1}`); }))
+  );
+  for (const s of data.sessions || []) {
+    const state = live.has(s.sessionId) ? "running" : "dead";
+    const kind = s.kind === "bg" ? "bg " : "int";
+    const where = paneOf.get(s.sessionId) || "-";
+    console.log(`  [${state.padEnd(7)}] ${kind} ${s.name.padEnd(28)} ${where.padEnd(7)} ${shortCwd(s.cwd)}`);
+  }
+  if (data.layout) {
+    const winCount = data.layout.length;
+    const paneCount = data.layout.reduce((n, w) => n + w.tabs.reduce((m, t) => m + t.panes.length, 0), 0);
+    console.log(`\nLayout: ${winCount} window(s), ${paneCount} pane(s) captured.`);
+  } else {
+    console.log("\nLayout: not captured (Ghostty scripting unavailable at snapshot time).");
+  }
+  if (source === "pending") {
+    console.log(`Run \`claude-resurrect restore\` to bring it all back.`);
+  }
+}
+
+// ------------------------------------------------------------------- restore
+
+function paneDir(cwd) {
+  return cwd && fs.existsSync(cwd) ? cwd : HOME;
+}
+
+/**
+ * Rebuild one window with N panes as a heuristic 2-column grid:
+ * pane 1 splits right of pane 0; each later pane splits down of the pane
+ * two before it. Types `claude --resume` into panes that had sessions.
+ */
+function buildWindow(panes) {
+  const lines = [`tell application "Ghostty"`, `  activate`];
+  panes.forEach((p, i) => {
+    lines.push(`  set cfg${i} to new surface configuration`);
+    lines.push(`  set initial working directory of cfg${i} to ${asQuoted(paneDir(p.cwd))}`);
+  });
+  lines.push(`  set win to new window with configuration cfg0`);
+  lines.push(`  delay 0.5`);
+  lines.push(`  set t0 to terminal 1 of tab 1 of win`);
+  for (let i = 1; i < panes.length; i++) {
+    const target = i === 1 ? "t0" : `t${i - 2}`;
+    const direction = i === 1 ? "right" : "down";
+    lines.push(`  set t${i} to split ${target} direction ${direction} with configuration cfg${i}`);
+    lines.push(`  delay 0.3`);
+  }
+  lines.push(`  delay 0.6`);
+  panes.forEach((p, i) => {
+    if (!p.resumeId) return;
+    lines.push(`  input text ${asQuoted(`claude --resume ${p.resumeId}`)} to t${i}`);
+    lines.push(`  send key "enter" to t${i}`);
+  });
+  lines.push(`end tell`);
+  osascript(lines.join("\n"));
+}
+
+/** Fallback: one Ghostty instance per window; window closes when claude exits. */
+function openViaOpen(cwd, sessionId) {
+  execFileSync("open", [
+    "-na", "Ghostty.app", "--args",
+    `--working-directory=${paneDir(cwd)}`,
+    "--quit-after-last-window-closed=true",
+    "-e", "claude", "--resume", sessionId,
+  ]);
+}
+
+let appleScriptBroken = false;
+function openWindow(panes) {
+  if (!appleScriptBroken) {
+    try {
+      buildWindow(panes);
+      return;
+    } catch (e) {
+      appleScriptBroken = true;
+      console.error(`  (AppleScript failed — falling back to \`open -n\`, sessions only, no splits: ${e.stderr?.toString().trim() || e.message})`);
+    }
+  }
+  for (const p of panes) {
+    if (p.resumeId) openViaOpen(p.cwd, p.resumeId);
+  }
+}
+
+async function restore(args) {
+  const dryRun = args.includes("--dry-run");
+  const includeBg = args.includes("--include-bg");
+
+  const loaded = loadRestorable();
+  if (!loaded) {
+    console.log("Nothing to restore: no snapshot found.");
+    console.log("Run `claude-resurrect install` so sessions get snapshotted from now on.");
+    return;
+  }
+  const { source, data } = loaded;
+  if (source === "current") {
+    console.log("Note: no pending-restore snapshot from a previous boot; using the latest live snapshot.");
+  }
+
+  const live = new Set(liveSessions().map((s) => s.sessionId));
+  const all = data.sessions || [];
+  const bySessionId = new Map(all.map((s) => [s.sessionId, s]));
+  const dead = (id) => bySessionId.has(id) && !live.has(id);
+  const placed = new Set(); // session ids restored (or skipped) via layout
+
+  let opened = 0;
+
+  // --- layout-aware pass: rebuild windows that held at least one dead session
+  for (const win of data.layout || []) {
+    // extra tabs are treated as their own windows (tab creation isn't
+    // reliably scriptable yet); each tab's panes become one window
+    for (const tab of win.tabs) {
+      for (const p of tab.panes) if (p.sessionId) placed.add(p.sessionId);
+      const deadHere = tab.panes.filter((p) => p.sessionId && dead(p.sessionId));
+      if (deadHere.length === 0) continue;
+      // rebuild the tab's panes; skip panes whose session still runs
+      const panes = tab.panes
+        .filter((p) => !p.sessionId || dead(p.sessionId))
+        .map((p) => ({ cwd: p.cwd, resumeId: p.sessionId && dead(p.sessionId) ? p.sessionId : null }));
+      const desc = panes
+        .map((p) => (p.resumeId ? bySessionId.get(p.resumeId).name : "shell"))
+        .join(" | ");
+      console.log(`${dryRun ? "[dry-run] would rebuild" : "rebuilding"} window: [ ${desc} ]  (${panes.length} pane${panes.length > 1 ? "s" : ""})`);
+      if (!dryRun) {
+        openWindow(panes);
+        opened++;
+        await new Promise((r) => setTimeout(r, 500));
+      }
+    }
+  }
+
+  // --- windowless pass: dead sessions that weren't in any captured pane
+  const strays = all.filter((s) => !placed.has(s.sessionId) && dead(s.sessionId));
+  const strayTargets = strays.filter((s) => s.kind === "interactive" || includeBg);
+  const bgSkipped = strays.filter((s) => s.kind === "bg" && !includeBg);
+
+  for (const s of strayTargets) {
+    console.log(`${dryRun ? "[dry-run] would open" : "opening"}  ${s.name.padEnd(28)} ${shortCwd(s.cwd)}`);
+    if (!dryRun) {
+      openWindow([{ cwd: s.cwd, resumeId: s.sessionId }]);
+      opened++;
+      await new Promise((r) => setTimeout(r, 500));
+    }
+  }
+
+  if (opened === 0 && strayTargets.length === 0 && !dryRun) {
+    console.log(all.some((s) => !live.has(s.sessionId))
+      ? "Nothing eligible to restore."
+      : "All snapshotted sessions are already running — nothing to do.");
+  }
+
+  if (bgSkipped.length > 0) {
+    console.log(`\nBackground agents that were running (not reopened — view with \`claude agents\`, or rerun with --include-bg):`);
+    for (const s of bgSkipped) {
+      console.log(`  ${s.name.padEnd(28)} claude --resume ${s.sessionId}`);
+    }
+  }
+
+  if (!dryRun && source === "pending") {
+    fs.rmSync(PENDING, { force: true });
+    console.log(`\nDone. Pending snapshot consumed (archived in ${ARCHIVE_DIR}).`);
+  }
+}
+
+// ------------------------------------------------------------ install/uninstall
+
+/**
+ * The LaunchAgent runs node through a symlink named `claude-resurrectd` so the
+ * background process shows up as "claude-resurrectd" (not "node") in ps,
+ * Activity Monitor, and System Settings > Login Items.
+ */
+function ensureDaemonLink() {
+  // prefer homebrew's stable symlink over the versioned Cellar path so node
+  // upgrades don't break the agent
+  const brewNode = "/opt/homebrew/bin/node";
+  const nodeBin = fs.existsSync(brewNode) ? brewNode : process.execPath;
+  fs.mkdirSync(path.dirname(DAEMON_LINK), { recursive: true });
+  fs.rmSync(DAEMON_LINK, { force: true });
+  fs.symlinkSync(nodeBin, DAEMON_LINK);
+  return DAEMON_LINK;
+}
+
+function plistXml() {
+  const daemon = ensureDaemonLink();
+  const self = fs.realpathSync(__filename);
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${PLIST_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${daemon}</string>
+    <string>${self}</string>
+    <string>snapshot</string>
+  </array>
+  <key>StartInterval</key><integer>${SNAPSHOT_INTERVAL_SECONDS}</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardErrorPath</key><string>${path.join(STATE_DIR, "snapshot.err.log")}</string>
+</dict>
+</plist>
+`;
+}
+
+function install() {
+  fs.mkdirSync(STATE_DIR, { recursive: true });
+  fs.mkdirSync(path.dirname(PLIST_PATH), { recursive: true });
+  fs.writeFileSync(PLIST_PATH, plistXml());
+  const domain = `gui/${process.getuid()}`;
+  try {
+    execSync(`launchctl bootout ${domain}/${PLIST_LABEL} 2>/dev/null`);
+  } catch {} // not loaded yet — fine
+  execSync(`launchctl bootstrap ${domain} ${JSON.stringify(PLIST_PATH)}`);
+  snapshot();
+  console.log(`Installed. Snapshotting every ${SNAPSHOT_INTERVAL_SECONDS}s via LaunchAgent:\n  ${PLIST_PATH}`);
+  console.log(`Background process name: claude-resurrectd`);
+  console.log(`State lives in ${STATE_DIR}`);
+  console.log(`After a reboot, run: claude-resurrect restore`);
+}
+
+function uninstall() {
+  const domain = `gui/${process.getuid()}`;
+  try {
+    execSync(`launchctl bootout ${domain}/${PLIST_LABEL} 2>/dev/null`);
+  } catch {}
+  fs.rmSync(PLIST_PATH, { force: true });
+  console.log("Uninstalled LaunchAgent. State files left in place:");
+  console.log(`  ${STATE_DIR}`);
+}
+
+// ---------------------------------------------------------------------- main
+
+const [cmd, ...rest] = process.argv.slice(2);
+const commands = { snapshot, list, install, uninstall };
+
+if (cmd === "restore") {
+  restore(rest).catch((e) => { console.error(e.message); process.exit(1); });
+} else if (commands[cmd]) {
+  try {
+    commands[cmd]();
+  } catch (e) {
+    console.error(e.message);
+    process.exit(1);
+  }
+} else {
+  console.log(`claude-resurrect — restore Claude Code sessions in Ghostty after a reboot
+
+usage:
+  claude-resurrect install     set up the background snapshotter (LaunchAgent)
+  claude-resurrect restore     rebuild windows/splits and resume dead sessions
+       --dry-run               show what would be reopened without doing it
+       --include-bg            also reopen stray background agents as windows
+  claude-resurrect list        show the sessions + layout in the latest snapshot
+  claude-resurrect snapshot    take one snapshot now (the LaunchAgent runs this)
+  claude-resurrect uninstall   remove the LaunchAgent`);
+}
