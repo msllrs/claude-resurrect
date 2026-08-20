@@ -365,11 +365,22 @@ function buildWindow(panes) {
   lines.push(`  delay 0.6`);
   panes.forEach((p, i) => {
     if (!p.resumeId) return;
-    lines.push(`  input text ${asQuoted(`claude --resume ${p.resumeId}`)} to t${i}`);
+    lines.push(`  input text ${asQuoted(resumeCommand(p))} to t${i}`);
     lines.push(`  send key "enter" to t${i}`);
   });
   lines.push(`end tell`);
   osascript(lines.join("\n"));
+}
+
+/**
+ * The typed shell command: retitle the pane to the session's name first
+ * (otherwise Ghostty titles the window "claude --resume <uuid>"), then resume.
+ * Escaping: asQuoted() doubles backslashes for AppleScript, so the shell
+ * receives the literal printf sequences \\033 / \\007.
+ */
+function resumeCommand(p) {
+  const title = String(p.resumeName || "claude").replace(/'/g, `'\\''`);
+  return `printf '\\033]0;%s\\007' '${title}'; claude --resume ${p.resumeId}`;
 }
 
 /** Fallback: one Ghostty instance per window; window closes when claude exits. */
@@ -438,7 +449,14 @@ async function restore(args) {
       // rebuild the tab's panes; skip panes whose session still runs
       const panes = tab.panes
         .filter((p) => !p.sessionId || dead(p.sessionId))
-        .map((p) => ({ cwd: p.cwd, resumeId: p.sessionId && dead(p.sessionId) ? p.sessionId : null }));
+        .map((p) => {
+          const resuming = p.sessionId && dead(p.sessionId);
+          return {
+            cwd: p.cwd,
+            resumeId: resuming ? p.sessionId : null,
+            resumeName: resuming ? bySessionId.get(p.sessionId).name : null,
+          };
+        });
       const desc = panes
         .map((p) => (p.resumeId ? bySessionId.get(p.resumeId).name : "shell"))
         .join(" | ");
@@ -459,7 +477,7 @@ async function restore(args) {
   for (const s of strayTargets) {
     console.log(`${dryRun ? "[dry-run] would open" : "opening"}  ${s.name.padEnd(28)} ${shortCwd(s.cwd)}`);
     if (!dryRun) {
-      openWindow([{ cwd: s.cwd, resumeId: s.sessionId }]);
+      openWindow([{ cwd: s.cwd, resumeId: s.sessionId, resumeName: s.name }]);
       opened++;
       await new Promise((r) => setTimeout(r, 500));
     }
