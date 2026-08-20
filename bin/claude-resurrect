@@ -27,7 +27,8 @@ const { execFileSync, execSync } = require("child_process");
 
 const HOME = os.homedir();
 const CLAUDE_SESSIONS_DIR = path.join(HOME, ".claude", "sessions");
-const STATE_DIR = path.join(HOME, ".local", "state", "claude-resurrect");
+const STATE_DIR =
+  process.env.CLAUDE_RESURRECT_STATE_DIR || path.join(HOME, ".local", "state", "claude-resurrect");
 const CURRENT = path.join(STATE_DIR, "current.json");
 const PENDING = path.join(STATE_DIR, "pending-restore.json");
 const ARCHIVE_DIR = path.join(STATE_DIR, "archive");
@@ -43,6 +44,18 @@ function bootTime() {
   const m = out.match(/sec\s*=\s*(\d+)/);
   if (!m) throw new Error(`could not parse kern.boottime: ${out}`);
   return Number(m[1]);
+}
+
+/**
+ * Stable per-boot identity. kern.boottime is NOT stable — macOS adjusts it
+ * on sleep/wake clock sync, which made "boot changed" fire spuriously.
+ */
+function bootId() {
+  try {
+    const id = execSync("sysctl -n kern.bootsessionuuid", { encoding: "utf8" }).trim();
+    if (id) return id;
+  } catch {}
+  return String(deps.bootTime());
 }
 
 function pidAlive(pid) {
@@ -77,6 +90,7 @@ function osascript(script) {
   return execFileSync("osascript", ["-e", script], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
+    timeout: 15000,
   });
 }
 
@@ -126,38 +140,44 @@ function liveSessions() {
 function captureGhosttyLayout() {
   // NB: inside the tell block, bare `tab` resolves to Ghostty's tab *class*,
   // not the tab character — hence the d variable defined outside it.
+  // The `is running` check must stay outside the tell block: telling a
+  // non-running app launches it, and a login-time tick must never do that.
   const script = `
 set d to character id 9
-tell application "Ghostty"
-  set out to ""
-  repeat with w in windows
-    set out to out & "W" & d & (id of w) & linefeed
-    repeat with tb in tabs of w
-      set out to out & "T" & d & ((index of tb) as text) & linefeed
-      repeat with t in terminals of tb
-        set cwdStr to ""
-        set titleStr to ""
-        set ttyStr to ""
-        try
-          set cwdStr to (working directory of t) as text
-        end try
-        try
-          set titleStr to (name of t) as text
-        end try
-        try
-          set ttyStr to (tty of t) as text
-        end try
-        set out to out & "P" & d & cwdStr & d & titleStr & d & ttyStr & linefeed
+set out to ""
+if application "Ghostty" is running then
+  tell application "Ghostty"
+    repeat with w in windows
+      set out to out & "W" & d & (id of w) & linefeed
+      repeat with tb in tabs of w
+        set out to out & "T" & d & ((index of tb) as text) & linefeed
+        repeat with t in terminals of tb
+          set cwdStr to ""
+          set titleStr to ""
+          set ttyStr to ""
+          try
+            set cwdStr to (working directory of t) as text
+          end try
+          try
+            set titleStr to (name of t) as text
+          end try
+          try
+            set ttyStr to (tty of t) as text
+          end try
+          set out to out & "P" & d & cwdStr & d & titleStr & d & ttyStr & linefeed
+        end repeat
       end repeat
     end repeat
-  end repeat
-  return out
-end tell`;
+  end tell
+end if
+return out`;
   let raw;
   try {
     raw = osascript(script);
-  } catch {
-    return null; // Ghostty not running, or Automation permission missing
+  } catch (e) {
+    const msg = (e.stderr && String(e.stderr).trim()) || e.message;
+    console.error(`[${new Date().toISOString()}] layout capture failed: ${msg}`);
+    return null;
   }
   const windows = [];
   let win = null, tab = null;
@@ -222,29 +242,54 @@ function matchSessionsToPanes(layout, sessions) {
   }
 }
 
+// ---------------------------------------------------------- injectable deps
+
+// Environment probes, indirected so tests can replace them.
+const deps = { bootId, bootTime, liveSessions, captureGhosttyLayout };
+
 // ------------------------------------------------------------------ snapshot
 
 function snapshot() {
-  const boot = bootTime();
+  const boot = deps.bootId();
+  const bootT = deps.bootTime();
   const prev = readJson(CURRENT);
+  // pre-bootId snapshots only carry bootTime — compare what's available
+  const bootChanged = prev
+    ? prev.bootId
+      ? prev.bootId !== boot
+      : prev.bootTime !== bootT
+    : false;
 
   // A snapshot from a previous boot means the machine went down while those
   // sessions were running. Preserve it before we overwrite.
-  if (prev && prev.bootTime !== boot && (prev.sessions || []).length > 0) {
+  if (prev && bootChanged && (prev.sessions || []).length > 0) {
     writeJsonAtomic(PENDING, prev);
     fs.mkdirSync(ARCHIVE_DIR, { recursive: true });
     writeJsonAtomic(path.join(ARCHIVE_DIR, `${prev.savedAt || "unknown"}.json`), prev);
   }
 
-  const sessions = liveSessions();
-  const layout = captureGhosttyLayout();
-  if (layout) matchSessionsToPanes(layout, sessions);
+  const sessions = deps.liveSessions();
+  let layout = deps.captureGhosttyLayout();
+  let layoutStale = false;
+  if (layout) {
+    matchSessionsToPanes(layout, sessions);
+  } else if (prev && !bootChanged && prev.layout) {
+    // Transient capture failure (AppleScript hiccup, permission blip): keep
+    // the last-known pane structure instead of destroying it, and re-match
+    // the currently-live sessions onto it.
+    layout = JSON.parse(JSON.stringify(prev.layout));
+    for (const w of layout) for (const t of w.tabs) for (const p of t.panes) p.sessionId = null;
+    matchSessionsToPanes(layout, sessions);
+    layoutStale = true;
+  }
 
   writeJsonAtomic(CURRENT, {
-    bootTime: boot,
+    bootId: boot,
+    bootTime: bootT,
     savedAt: new Date().toISOString().replace(/[:.]/g, "-"),
     sessions,
     layout,
+    layoutStale,
   });
 }
 
@@ -265,7 +310,7 @@ function list() {
     return;
   }
   const { source, data } = loaded;
-  const live = new Set(liveSessions().map((s) => s.sessionId));
+  const live = new Set(deps.liveSessions().map((s) => s.sessionId));
   const label = source === "pending" ? "pending restore (saved before last shutdown/crash)" : "latest snapshot";
   console.log(`Sessions in ${label}:\n`);
   const paneOf = new Map();
@@ -281,7 +326,8 @@ function list() {
   if (data.layout) {
     const winCount = data.layout.length;
     const paneCount = data.layout.reduce((n, w) => n + w.tabs.reduce((m, t) => m + t.panes.length, 0), 0);
-    console.log(`\nLayout: ${winCount} window(s), ${paneCount} pane(s) captured.`);
+    const stale = data.layoutStale ? " (stale — from the last successful capture)" : "";
+    console.log(`\nLayout: ${winCount} window(s), ${paneCount} pane(s) captured${stale}.`);
   } else {
     console.log("\nLayout: not captured (Ghostty scripting unavailable at snapshot time).");
   }
@@ -367,11 +413,17 @@ async function restore(args) {
     console.log("Note: no pending-restore snapshot from a previous boot; using the latest live snapshot.");
   }
 
-  const live = new Set(liveSessions().map((s) => s.sessionId));
+  const live = new Set(deps.liveSessions().map((s) => s.sessionId));
   const all = data.sessions || [];
   const bySessionId = new Map(all.map((s) => [s.sessionId, s]));
   const dead = (id) => bySessionId.has(id) && !live.has(id);
   const placed = new Set(); // session ids restored (or skipped) via layout
+
+  if (!data.layout) {
+    console.log("Warning: this snapshot has no window layout (Ghostty wasn't scriptable when it was taken) — falling back to one window per session, no splits.");
+  } else if (data.layoutStale) {
+    console.log("Note: layout is from the last successful capture before the machine went down; pane arrangement may be slightly out of date.");
+  }
 
   let opened = 0;
 
@@ -420,7 +472,8 @@ async function restore(args) {
   }
 
   if (bgSkipped.length > 0) {
-    console.log(`\nBackground agents that were running (not reopened — view with \`claude agents\`, or rerun with --include-bg):`);
+    console.log(`\nNOTE: ${bgSkipped.length} background agent(s) were running but are NOT reopened automatically.`);
+    console.log(`View them with \`claude agents\`, rerun with --include-bg, or resume individually:`);
     for (const s of bgSkipped) {
       console.log(`  ${s.name.padEnd(28)} claude --resume ${s.sessionId}`);
     }
@@ -499,6 +552,12 @@ function uninstall() {
 }
 
 // ---------------------------------------------------------------------- main
+
+if (require.main !== module) {
+  // test/embedding interface — CLI dispatch below is skipped
+  module.exports = { snapshot, deps };
+  return;
+}
 
 const [cmd, ...rest] = process.argv.slice(2);
 const commands = { snapshot, list, install, uninstall };
