@@ -17,9 +17,9 @@ Claude Code maintains a live registry of every running session at `~/.claude/ses
 1. **A LaunchAgent snapshots every 30 seconds** into `~/.local/state/claude-resurrect/`:
    - the session registry, and
    - Ghostty's window → tab → pane tree (via AppleScript), with each pane matched to the Claude session running in it — by tty when Ghostty exposes it (post-1.3), else by terminal title (Claude sets titles for named sessions/agents), else by working directory.
-2. Each snapshot is stamped with the machine's boot time (`kern.boottime`). Sessions you close normally disappear from the registry and are pruned on the next tick — they're never resurrected.
-3. **After a reboot**, the first tick sees the boot time changed and preserves the pre-crash snapshot as `pending-restore.json` (also archived in `archive/`).
-4. **`claude-resurrect restore`** rebuilds each window that held Claude sessions: recreates its panes as splits, types `claude --resume <session-id>` into the matched panes, and opens plain shells at the right cwd in the rest. Sessions that weren't in any captured pane get their own window. Already-running sessions are skipped, so `restore` is always safe to run.
+2. Each snapshot is stamped with the boot session UUID (`kern.bootsessionuuid` — stable across sleep/wake, unlike `kern.boottime`). Sessions you close normally disappear from the registry and are pruned on the next tick — they're never resurrected. If a layout capture fails transiently (AppleScript hiccup, locked screen), the last known layout is carried forward and marked stale instead of being lost.
+3. **After a reboot**, the first tick sees the boot session changed and preserves the pre-crash snapshot as `pending-restore.json` (also archived in `archive/`).
+4. **`claude-resurrect restore`** rebuilds each window that held Claude sessions: recreates its panes as splits, types `claude --resume <session-id>` into the matched panes (prefixed with a title escape so each pane is named after its session, not the raw command), and opens plain shells at the right cwd in the rest. Sessions that weren't in any captured pane get their own window. Already-running sessions are skipped, so `restore` is always safe to run.
 
 Split *arrangement* is heuristic (a 2-column grid), not pixel-exact — the AppleScript API exposes which panes share a window but not their geometry. Pane count, grouping, working directories, and sessions are all faithful.
 
