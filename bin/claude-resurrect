@@ -386,11 +386,32 @@ function paneDir(cwd) {
 }
 
 /**
- * Rebuild one window with N panes as a heuristic 2-column grid:
- * pane 1 splits right of pane 0; each later pane splits down of the pane
- * two before it. Types `claude --resume` into panes that had sessions.
+ * Split arrangement for N panes: entry i says how pane i+1 splits off —
+ * {target: <pane index>, direction: "right"|"down"}. Ghostty 1.3.1's
+ * AppleScript dictionary exposes no terminal position/size (checked
+ * Ghostty.sdef), so original geometry can't be captured; the arrangement is
+ * a heuristic, and the style lets users pick the shape they actually work in:
+ *   grid    — 2-column grid: pane 1 right of pane 0, pane i down from pane i-2
+ *   columns — every pane right of the previous one
+ *   rows    — every pane down from the previous one
  */
-function buildWindow(panes) {
+const LAYOUT_STYLES = ["grid", "columns", "rows"];
+function splitPlan(count, style) {
+  const plan = [];
+  for (let i = 1; i < count; i++) {
+    if (style === "columns") plan.push({ target: i - 1, direction: "right" });
+    else if (style === "rows") plan.push({ target: i - 1, direction: "down" });
+    else if (i === 1) plan.push({ target: 0, direction: "right" });
+    else plan.push({ target: i - 2, direction: "down" });
+  }
+  return plan;
+}
+
+/**
+ * Rebuild one window with N panes arranged per splitPlan(style).
+ * Types `claude --resume` into panes that had sessions.
+ */
+function buildWindow(panes, style) {
   const lines = [`tell application "Ghostty"`, `  activate`];
   panes.forEach((p, i) => {
     lines.push(`  set cfg${i} to new surface configuration`);
@@ -399,12 +420,10 @@ function buildWindow(panes) {
   lines.push(`  set win to new window with configuration cfg0`);
   lines.push(`  delay 0.5`);
   lines.push(`  set t0 to terminal 1 of tab 1 of win`);
-  for (let i = 1; i < panes.length; i++) {
-    const target = i === 1 ? "t0" : `t${i - 2}`;
-    const direction = i === 1 ? "right" : "down";
-    lines.push(`  set t${i} to split ${target} direction ${direction} with configuration cfg${i}`);
+  splitPlan(panes.length, style).forEach(({ target, direction }, idx) => {
+    lines.push(`  set t${idx + 1} to split t${target} direction ${direction} with configuration cfg${idx + 1}`);
     lines.push(`  delay 0.3`);
-  }
+  });
   lines.push(`  delay 0.6`);
   panes.forEach((p, i) => {
     if (!p.resumeId) return;
@@ -437,10 +456,10 @@ function openViaOpen(cwd, sessionId) {
 }
 
 let appleScriptBroken = false;
-function openWindow(panes) {
+function openWindow(panes, style) {
   if (!appleScriptBroken) {
     try {
-      buildWindow(panes);
+      buildWindow(panes, style);
       return;
     } catch (e) {
       appleScriptBroken = true;
@@ -452,9 +471,26 @@ function openWindow(panes) {
   }
 }
 
+/**
+ * Split style for this restore run: --layout <style> wins, then the
+ * CLAUDE_RESURRECT_LAYOUT env var (read here, at restore time, so tests and
+ * shells that set it after module load still take effect), then "grid".
+ * Unknown styles warn and fall back — a bad flag must never abort a
+ * crash-recovery run.
+ */
+function layoutStyle(args) {
+  const flagIdx = args.indexOf("--layout");
+  const requested =
+    (flagIdx !== -1 && args[flagIdx + 1]) || process.env.CLAUDE_RESURRECT_LAYOUT || "grid";
+  if (LAYOUT_STYLES.includes(requested)) return requested;
+  console.log(`Warning: unknown layout style "${requested}" — using "grid" (valid: ${LAYOUT_STYLES.join(", ")}).`);
+  return "grid";
+}
+
 async function restore(args) {
   const dryRun = args.includes("--dry-run");
   const includeBg = args.includes("--include-bg");
+  const style = layoutStyle(args);
 
   const loaded = loadRestorable();
   if (!loaded) {
@@ -518,7 +554,7 @@ async function restore(args) {
         .join(" | ");
       console.log(`${dryRun ? "[dry-run] would rebuild" : "rebuilding"} window: [ ${desc} ]  (${panes.length} pane${panes.length > 1 ? "s" : ""})`);
       if (!dryRun) {
-        deps.openWindow(panes);
+        deps.openWindow(panes, style);
         opened++;
         await new Promise((r) => setTimeout(r, 500));
       }
@@ -533,7 +569,7 @@ async function restore(args) {
   for (const s of strayTargets) {
     console.log(`${dryRun ? "[dry-run] would open" : "opening"}  ${s.name.padEnd(28)} ${shortCwd(s.cwd)}`);
     if (!dryRun) {
-      deps.openWindow([{ cwd: s.cwd, resumeId: s.sessionId, resumeName: s.name }]);
+      deps.openWindow([{ cwd: s.cwd, resumeId: s.sessionId, resumeName: s.name }], style);
       opened++;
       await new Promise((r) => setTimeout(r, 500));
     }
@@ -636,7 +672,7 @@ function uninstall() {
 
 if (require.main !== module) {
   // test/embedding interface — CLI dispatch below is skipped
-  module.exports = { snapshot, restore, deps };
+  module.exports = { snapshot, restore, splitPlan, deps };
   return;
 }
 
@@ -660,6 +696,8 @@ usage:
   claude-resurrect restore     rebuild windows/splits and resume dead sessions
        --dry-run               show what would be reopened without doing it
        --include-bg            also reopen stray background agents as windows
+       --layout <style>        split arrangement: grid | columns | rows
+                               (default: $CLAUDE_RESURRECT_LAYOUT, else grid)
   claude-resurrect list        show the sessions + layout in the latest snapshot
   claude-resurrect snapshot    take one snapshot now (the LaunchAgent runs this)
   claude-resurrect uninstall   remove the LaunchAgent`);
