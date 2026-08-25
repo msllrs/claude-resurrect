@@ -26,6 +26,8 @@ const path = require("path");
 function freshStateDir() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-resurrect-test-"));
   process.env.CLAUDE_RESURRECT_STATE_DIR = dir;
+  // point at a nonexistent config so the developer's real one never leaks in
+  process.env.CLAUDE_RESURRECT_CONFIG = path.join(dir, "config.json");
   return dir;
 }
 
