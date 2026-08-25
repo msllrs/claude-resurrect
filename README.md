@@ -53,6 +53,8 @@ If layout capture stops working (check `snapshot.err.log` in the state dir), gra
 - **Tabs** are restored as separate windows for now (tab creation isn't reliably scriptable yet).
 - **Automation permission**: AppleScript calls need macOS Automation approval (one prompt per binary). If AppleScript fails entirely, restore falls back to `open -na Ghostty` — sessions come back, but one window each and no splits.
 - **Cross-directory resume** requires Claude Code ≥ 2.1.223. If a session's cwd no longer exists (e.g. a cleaned-up worktree), it resumes from `~` instead.
+- **Transcript-less sessions are skipped.** A snapshotted session whose conversation transcript no longer exists under `~/.claude/projects/` can't be resumed, so restore drops it (and says so) instead of opening a window for `claude --resume` to fail in.
+- **Pid reuse is guarded against.** A registry entry only counts as live if its pid is still running a claude process — stale registry files whose pids were reused by unrelated processes are no longer snapshotted as live.
 
 ## Fragility
 

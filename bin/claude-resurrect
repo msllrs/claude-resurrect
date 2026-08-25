@@ -18,6 +18,12 @@
  *
  * Sessions that exit gracefully while the machine is up disappear from the
  * live registry and are pruned on the next tick, so they are never resurrected.
+ *
+ * Stale-registry hardening: a registry entry only counts as live if its pid is
+ * alive AND still running a claude process (pids get reused after crashes and
+ * reboots). And restore only resumes sessions that have a conversation
+ * transcript on disk — anything else would just open a window for
+ * `claude --resume` to fail in.
  */
 
 const fs = require("fs");
@@ -26,7 +32,9 @@ const path = require("path");
 const { execFileSync, execSync } = require("child_process");
 
 const HOME = os.homedir();
-const CLAUDE_SESSIONS_DIR = path.join(HOME, ".claude", "sessions");
+const CLAUDE_SESSIONS_DIR =
+  process.env.CLAUDE_RESURRECT_SESSIONS_DIR || path.join(HOME, ".claude", "sessions");
+const CLAUDE_PROJECTS_DIR = path.join(HOME, ".claude", "projects");
 const STATE_DIR =
   process.env.CLAUDE_RESURRECT_STATE_DIR || path.join(HOME, ".local", "state", "claude-resurrect");
 const CURRENT = path.join(STATE_DIR, "current.json");
@@ -104,6 +112,32 @@ function shortCwd(cwd) {
 
 // ------------------------------------------------------- claude live registry
 
+/** The command line running at a pid, or null. Real impl of deps.pidCommand. */
+function pidCommand(pid) {
+  try {
+    const out = execSync(`ps -o command= -p ${pid}`, { encoding: "utf8" }).trim();
+    return out || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Does a resumable conversation transcript exist for this session?
+ * Claude Code writes one per session at ~/.claude/projects/<munged-cwd>/<id>.jsonl;
+ * the cwd munging is claude's business, so scan every project dir instead of
+ * trying to reproduce it. Real impl of deps.hasConversation.
+ */
+function hasConversation(sessionId) {
+  let dirs;
+  try {
+    dirs = fs.readdirSync(CLAUDE_PROJECTS_DIR);
+  } catch {
+    return false;
+  }
+  return dirs.some((d) => fs.existsSync(path.join(CLAUDE_PROJECTS_DIR, d, `${sessionId}.jsonl`)));
+}
+
 /** Read Claude Code's live registry: one JSON file per running process. */
 function liveSessions() {
   let files;
@@ -117,6 +151,13 @@ function liveSessions() {
     const s = readJson(path.join(CLAUDE_SESSIONS_DIR, f));
     if (!s || !s.sessionId || !s.pid) continue;
     if (!pidAlive(s.pid)) continue;
+    // pid liveness alone is a trap: registry files from crashed sessions
+    // survive reboots, and their pids get reused by unrelated processes
+    // (EPERM from a system daemon also passes pidAlive). Only trust the pid
+    // if it still runs something claude-shaped; no readable command for an
+    // "alive" pid is exactly the pid-reuse case, so that counts as dead too.
+    const cmd = deps.pidCommand(s.pid);
+    if (!cmd || !cmd.includes("claude")) continue;
     sessions.push({
       sessionId: s.sessionId,
       pid: s.pid,
@@ -244,8 +285,10 @@ function matchSessionsToPanes(layout, sessions) {
 
 // ---------------------------------------------------------- injectable deps
 
-// Environment probes, indirected so tests can replace them.
-const deps = { bootId, bootTime, liveSessions, captureGhosttyLayout };
+// Environment probes and effects, indirected so tests can replace them.
+// (openWindow is declared below in the restore section; hoisting makes it
+// visible here.)
+const deps = { bootId, bootTime, liveSessions, captureGhosttyLayout, pidCommand, hasConversation, openWindow };
 
 // ------------------------------------------------------------------ snapshot
 
@@ -428,6 +471,12 @@ async function restore(args) {
   const all = data.sessions || [];
   const bySessionId = new Map(all.map((s) => [s.sessionId, s]));
   const dead = (id) => bySessionId.has(id) && !live.has(id);
+  // Dead sessions with no conversation transcript on disk can't be resumed —
+  // `claude --resume` would just fail with "No conversation found". Skip them
+  // everywhere (panes and strays) instead of opening ghost windows.
+  const noTranscript = all.filter((s) => dead(s.sessionId) && !deps.hasConversation(s.sessionId));
+  const ghosts = new Set(noTranscript.map((s) => s.sessionId));
+  const resumable = (id) => dead(id) && !ghosts.has(id);
   const placed = new Set(); // session ids restored (or skipped) via layout
 
   if (!data.layout) {
@@ -444,13 +493,14 @@ async function restore(args) {
     // reliably scriptable yet); each tab's panes become one window
     for (const tab of win.tabs) {
       for (const p of tab.panes) if (p.sessionId) placed.add(p.sessionId);
-      const deadHere = tab.panes.filter((p) => p.sessionId && dead(p.sessionId));
+      const deadHere = tab.panes.filter((p) => p.sessionId && resumable(p.sessionId));
       if (deadHere.length === 0) continue;
-      // rebuild the tab's panes; skip panes whose session still runs
+      // rebuild the tab's panes; skip panes whose session still runs, and
+      // panes whose dead session has no transcript to resume
       const panes = tab.panes
-        .filter((p) => !p.sessionId || dead(p.sessionId))
+        .filter((p) => !p.sessionId || resumable(p.sessionId))
         .map((p) => {
-          const resuming = p.sessionId && dead(p.sessionId);
+          const resuming = p.sessionId && resumable(p.sessionId);
           return {
             cwd: p.cwd,
             resumeId: resuming ? p.sessionId : null,
@@ -462,7 +512,7 @@ async function restore(args) {
         .join(" | ");
       console.log(`${dryRun ? "[dry-run] would rebuild" : "rebuilding"} window: [ ${desc} ]  (${panes.length} pane${panes.length > 1 ? "s" : ""})`);
       if (!dryRun) {
-        openWindow(panes);
+        deps.openWindow(panes);
         opened++;
         await new Promise((r) => setTimeout(r, 500));
       }
@@ -470,14 +520,14 @@ async function restore(args) {
   }
 
   // --- windowless pass: dead sessions that weren't in any captured pane
-  const strays = all.filter((s) => !placed.has(s.sessionId) && dead(s.sessionId));
+  const strays = all.filter((s) => !placed.has(s.sessionId) && resumable(s.sessionId));
   const strayTargets = strays.filter((s) => s.kind === "interactive" || includeBg);
   const bgSkipped = strays.filter((s) => s.kind === "bg" && !includeBg);
 
   for (const s of strayTargets) {
     console.log(`${dryRun ? "[dry-run] would open" : "opening"}  ${s.name.padEnd(28)} ${shortCwd(s.cwd)}`);
     if (!dryRun) {
-      openWindow([{ cwd: s.cwd, resumeId: s.sessionId, resumeName: s.name }]);
+      deps.openWindow([{ cwd: s.cwd, resumeId: s.sessionId, resumeName: s.name }]);
       opened++;
       await new Promise((r) => setTimeout(r, 500));
     }
@@ -487,6 +537,13 @@ async function restore(args) {
     console.log(all.some((s) => !live.has(s.sessionId))
       ? "Nothing eligible to restore."
       : "All snapshotted sessions are already running — nothing to do.");
+  }
+
+  if (noTranscript.length > 0) {
+    console.log(`\nNOTE: ${noTranscript.length} session(s) skipped — no conversation transcript on disk, so \`claude --resume\` has nothing to load:`);
+    for (const s of noTranscript) {
+      console.log(`  ${s.name.padEnd(28)} ${s.sessionId.slice(0, 8)}`);
+    }
   }
 
   if (bgSkipped.length > 0) {
@@ -573,7 +630,7 @@ function uninstall() {
 
 if (require.main !== module) {
   // test/embedding interface — CLI dispatch below is skipped
-  module.exports = { snapshot, deps };
+  module.exports = { snapshot, restore, deps };
   return;
 }
 
