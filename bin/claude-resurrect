@@ -110,6 +110,53 @@ function shortCwd(cwd) {
   return cwd && cwd.startsWith(HOME) ? "~" + cwd.slice(HOME.length) : cwd || "?";
 }
 
+// -------------------------------------------------------------------- config
+
+const CONFIG_KEYS = ["layout", "includeBg", "snapshotIntervalSeconds"];
+
+// Resolved at call time, not module load: tests (and shells) may change the
+// env var between calls within one process.
+function configPath() {
+  return (
+    process.env.CLAUDE_RESURRECT_CONFIG ||
+    path.join(HOME, ".config", "claude-resurrect", "config.json")
+  );
+}
+
+/**
+ * User preferences, so flags and env vars don't have to be remembered.
+ * A missing or malformed file means defaults, never a throw — restore is
+ * crash recovery, and a typo in a config file must not block it.
+ */
+function loadConfig() {
+  const cfg = readJson(configPath());
+  if (!cfg || typeof cfg !== "object" || Array.isArray(cfg)) return {};
+  const unknown = Object.keys(cfg).filter((k) => !CONFIG_KEYS.includes(k));
+  if (unknown.length > 0) {
+    console.log(`Warning: unknown config key(s) ignored: ${unknown.join(", ")} (known: ${CONFIG_KEYS.join(", ")}).`);
+  }
+  return cfg;
+}
+
+/** LaunchAgent tick, seconds: config wins if it's a positive number. */
+function snapshotInterval(cfg) {
+  const v = cfg.snapshotIntervalSeconds;
+  return typeof v === "number" && v > 0 ? v : SNAPSHOT_INTERVAL_SECONDS;
+}
+
+/** `config` command: where the file is and what actually takes effect. */
+function showConfig() {
+  const file = configPath();
+  const exists = fs.existsSync(file);
+  const cfg = loadConfig();
+  console.log(`Config file: ${file}${exists ? "" : " (not found — defaults apply)"}\n`);
+  console.log(`Effective settings (flag > env > config > default):\n`);
+  console.log(`  ${"layout".padEnd(28)} ${layoutStyle([], cfg)}`);
+  console.log(`  ${"includeBg".padEnd(28)} ${cfg.includeBg === true}`);
+  console.log(`  ${"snapshotIntervalSeconds".padEnd(28)} ${snapshotInterval(cfg)}`);
+  console.log(`\nChanging snapshotIntervalSeconds takes effect after \`claude-resurrect install\`.`);
+}
+
 // ------------------------------------------------------- claude live registry
 
 /** The command line running at a pid, or null. Real impl of deps.pidCommand. */
@@ -474,23 +521,27 @@ function openWindow(panes, style) {
 /**
  * Split style for this restore run: --layout <style> wins, then the
  * CLAUDE_RESURRECT_LAYOUT env var (read here, at restore time, so tests and
- * shells that set it after module load still take effect), then "grid".
- * Unknown styles warn and fall back — a bad flag must never abort a
- * crash-recovery run.
+ * shells that set it after module load still take effect), then the config
+ * file's `layout`, then "grid". Unknown styles warn and fall back — a bad
+ * flag must never abort a crash-recovery run.
  */
-function layoutStyle(args) {
+function layoutStyle(args, config) {
   const flagIdx = args.indexOf("--layout");
   const requested =
-    (flagIdx !== -1 && args[flagIdx + 1]) || process.env.CLAUDE_RESURRECT_LAYOUT || "grid";
+    (flagIdx !== -1 && args[flagIdx + 1]) ||
+    process.env.CLAUDE_RESURRECT_LAYOUT ||
+    config.layout ||
+    "grid";
   if (LAYOUT_STYLES.includes(requested)) return requested;
   console.log(`Warning: unknown layout style "${requested}" — using "grid" (valid: ${LAYOUT_STYLES.join(", ")}).`);
   return "grid";
 }
 
 async function restore(args) {
+  const config = loadConfig();
   const dryRun = args.includes("--dry-run");
-  const includeBg = args.includes("--include-bg");
-  const style = layoutStyle(args);
+  const includeBg = args.includes("--include-bg") || config.includeBg === true;
+  const style = layoutStyle(args, config);
 
   const loaded = loadRestorable();
   if (!loaded) {
@@ -623,6 +674,9 @@ function ensureDaemonLink() {
 function plistXml() {
   const daemon = ensureDaemonLink();
   const self = fs.realpathSync(__filename);
+  // The interval is baked into the plist, so changing snapshotIntervalSeconds
+  // in the config file only takes effect on the next `claude-resurrect install`.
+  const interval = snapshotInterval(loadConfig());
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -634,7 +688,7 @@ function plistXml() {
     <string>${self}</string>
     <string>snapshot</string>
   </array>
-  <key>StartInterval</key><integer>${SNAPSHOT_INTERVAL_SECONDS}</integer>
+  <key>StartInterval</key><integer>${interval}</integer>
   <key>RunAtLoad</key><true/>
   <key>StandardErrorPath</key><string>${path.join(STATE_DIR, "snapshot.err.log")}</string>
 </dict>
@@ -652,7 +706,7 @@ function install() {
   } catch {} // not loaded yet — fine
   execSync(`launchctl bootstrap ${domain} ${JSON.stringify(PLIST_PATH)}`);
   snapshot();
-  console.log(`Installed. Snapshotting every ${SNAPSHOT_INTERVAL_SECONDS}s via LaunchAgent:\n  ${PLIST_PATH}`);
+  console.log(`Installed. Snapshotting every ${snapshotInterval(loadConfig())}s via LaunchAgent:\n  ${PLIST_PATH}`);
   console.log(`Background process name: claude-resurrectd`);
   console.log(`State lives in ${STATE_DIR}`);
   console.log(`After a reboot, run: claude-resurrect restore`);
@@ -672,12 +726,12 @@ function uninstall() {
 
 if (require.main !== module) {
   // test/embedding interface — CLI dispatch below is skipped
-  module.exports = { snapshot, restore, splitPlan, deps };
+  module.exports = { snapshot, restore, splitPlan, plistXml, deps };
   return;
 }
 
 const [cmd, ...rest] = process.argv.slice(2);
-const commands = { snapshot, list, install, uninstall };
+const commands = { snapshot, list, install, uninstall, config: showConfig };
 
 if (cmd === "restore") {
   restore(rest).catch((e) => { console.error(e.message); process.exit(1); });
@@ -697,8 +751,12 @@ usage:
        --dry-run               show what would be reopened without doing it
        --include-bg            also reopen stray background agents as windows
        --layout <style>        split arrangement: grid | columns | rows
-                               (default: $CLAUDE_RESURRECT_LAYOUT, else grid)
+                               (default: $CLAUDE_RESURRECT_LAYOUT, then the
+                               config file's layout, else grid)
   claude-resurrect list        show the sessions + layout in the latest snapshot
   claude-resurrect snapshot    take one snapshot now (the LaunchAgent runs this)
+  claude-resurrect config      show the config file path and effective settings
+                               (~/.config/claude-resurrect/config.json; keys:
+                               layout, includeBg, snapshotIntervalSeconds)
   claude-resurrect uninstall   remove the LaunchAgent`);
 }
