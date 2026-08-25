@@ -21,7 +21,7 @@ Claude Code maintains a live registry of every running session at `~/.claude/ses
 3. **After a reboot**, the first tick sees the boot session changed and preserves the pre-crash snapshot as `pending-restore.json` (also archived in `archive/`).
 4. **`claude-resurrect restore`** rebuilds each window that held Claude sessions: recreates its panes as splits, types `claude --resume <session-id>` into the matched panes (prefixed with a title escape so each pane is named after its session, not the raw command), and opens plain shells at the right cwd in the rest. Sessions that weren't in any captured pane get their own window. Already-running sessions are skipped, so `restore` is always safe to run.
 
-Split *arrangement* is heuristic, not pixel-exact — Ghostty's AppleScript dictionary exposes which panes share a window but no terminal geometry (verified against 1.3.1's sdef: no position/size on the terminal class). Pane count, grouping, working directories, and sessions are all faithful, and you pick the arrangement shape with `--layout grid|columns|rows` (or set `CLAUDE_RESURRECT_LAYOUT` once in your shell profile; default `grid`).
+Split *arrangement* is heuristic, not pixel-exact — Ghostty's AppleScript dictionary exposes which panes share a window but no terminal geometry (verified against 1.3.1's sdef: no position/size on the terminal class). Pane count, grouping, working directories, and sessions are all faithful, and you pick the arrangement shape with `--layout grid|columns|rows` (or set it once in the config file; default `grid`).
 
 Background agents that were running standalone are listed at the end with their resume commands rather than auto-opened — check them in agent view (`claude agents`) or rerun with `--include-bg`.
 
@@ -47,8 +47,27 @@ claude-resurrect restore --dry-run
 claude-resurrect restore --include-bg
 claude-resurrect restore --layout columns   # split arrangement: grid | columns | rows
 claude-resurrect list        # sessions + layout in the latest snapshot
+claude-resurrect config      # show the config file path + effective settings
 claude-resurrect uninstall
 ```
+
+## Configuration
+
+Optional, at `~/.config/claude-resurrect/config.json`:
+
+```json
+{
+  "layout": "columns",
+  "includeBg": false,
+  "snapshotIntervalSeconds": 30
+}
+```
+
+- **layout** — split arrangement for rebuilt windows: `grid` (default), `columns`, or `rows`. Precedence: `--layout` flag > `CLAUDE_RESURRECT_LAYOUT` env > config.
+- **includeBg** — `true` reopens stray background agents on every restore, same as passing `--include-bg`.
+- **snapshotIntervalSeconds** — how often the LaunchAgent snapshots (default 30). Rerun `claude-resurrect install` after changing it — the interval is baked into the plist.
+
+A missing or malformed config file just means defaults — restore is crash recovery, so a typo in the config never blocks it. `claude-resurrect config` shows what's actually in effect.
 
 ## The background process
 
