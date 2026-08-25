@@ -501,10 +501,16 @@ async function restore(args) {
         .filter((p) => !p.sessionId || resumable(p.sessionId))
         .map((p) => {
           const resuming = p.sessionId && resumable(p.sessionId);
+          // Resuming panes must start in the SESSION's cwd, not the pane's:
+          // Ghostty reports the shell's launch dir, not the claude process's
+          // cwd (a worktree agent launched from the repo root reports the
+          // root). Resuming in the wrong dir re-homes the session under the
+          // wrong project and duplicates worktree agents.
+          const session = resuming ? bySessionId.get(p.sessionId) : null;
           return {
-            cwd: p.cwd,
+            cwd: (session && session.cwd) || p.cwd,
             resumeId: resuming ? p.sessionId : null,
-            resumeName: resuming ? bySessionId.get(p.sessionId).name : null,
+            resumeName: resuming ? session.name : null,
           };
         });
       const desc = panes
