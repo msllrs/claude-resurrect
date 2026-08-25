@@ -1,0 +1,31 @@
+{
+  "name": "claude-resurrect",
+  "version": "0.1.0",
+  "description": "Bring back your Claude Code sessions in Ghostty after a reboot or crash — windows, splits, and resumed conversations.",
+  "bin": {
+    "claude-resurrect": "bin/claude-resurrect"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "darwin"
+  ],
+  "author": "Matt Sellers",
+  "license": "MIT",
+  "keywords": [
+    "claude-code",
+    "ghostty",
+    "session-restore",
+    "crash-recovery",
+    "macos"
+  ],
+  "files": [
+    "bin",
+    "README.md",
+    "LICENSE"
+  ]
+}
