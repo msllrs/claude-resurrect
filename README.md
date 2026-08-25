@@ -95,18 +95,6 @@ Two integration points are undocumented/preview and may change:
 - `~/.claude/sessions/*.json` is Claude Code internal (observed on v2.1.235). If it changes, the fallback is a `SessionStart`/`SessionEnd` hook pair maintaining our own registry — the hook payload includes `session_id` and `cwd`.
 - Ghostty's AppleScript API is marked preview; breaking changes are expected in 1.4. The `open -n` fallback covers total breakage; layout capture degrades gracefully to session-only snapshots.
 
-## Prior art
-
-- [Supersynergy/claude-session-restore](https://github.com/Supersynergy/claude-session-restore) — multi-terminal (Ghostty included), but restores from transcript *history* with recency/keyword ranking ("10 newest + 5 leverage picks"); no snapshot of what was actually open, no layout, no interactive/background distinction.
-- [Livshitz/claude-revive](https://github.com/Livshitz/claude-revive) — closest in spirit: reconstructs which sessions were live at crash time, but via heuristics (transcript-flush timestamps near boot) plus an interactive picker; macOS, mainly VSCode/Cursor, no layout restore.
-- [Mahrkeenerh/ClaudeRestore](https://github.com/Mahrkeenerh/ClaudeRestore) — Linux equivalent; also verifies transcripts exist before resuming.
-- [asadtariq96/cc-session-restore](https://github.com/asadtariq96/cc-session-restore) — same periodic-snapshot idea, iTerm2 only.
-- [Franvy/gtab](https://github.com/Franvy/gtab) — Ghostty tab/split *layout* restore (manual named saves, Accessibility-based exact geometry), no processes/sessions.
-- [ericblue/cmux-session-manager](https://github.com/ericblue/cmux-session-manager) — snapshot + layout + Claude resumption, but for cmux workspaces.
-- tmux + [tmux-claude-resurrect](https://github.com/cookiecad/tmux-claude-resurrect), or [Quil](https://quil.cc/blog/resume-claude-code-session-after-reboot/) — solve it by living inside a multiplexer that survives reboots, with the terminal friction that implies.
-
-The niche this fills: knowing exactly which sessions were *open at the moment the machine died* (a 30s ground-truth snapshot keyed to the boot session UUID, not timestamp heuristics), which window/split each one lived in, distinguishing interactive windows from background agents, and restoring natively into Ghostty. Upstream demand: [anthropics/claude-code#34829](https://github.com/anthropics/claude-code/issues/34829).
-
 ## License
 
 MIT
